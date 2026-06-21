@@ -29,6 +29,8 @@
  *   - Adafruit ST7735 and ST7789 Library
  *   - Adafruit BusIO (dependency)
  *   - Adafruit MAX31855 library
+ *   - Servo
+ *   - PID by Brett Beauregard (PID_v1)
  *
  * Target-temperature potentiometer (10k):
  *   One outer leg -> 3.3V
@@ -45,6 +47,7 @@
 #include <Adafruit_ST7789.h>
 #include <Adafruit_MAX31855.h>
 #include <Servo.h>
+#include <PID_v1.h>
 #include <SPI.h>
 
 // ---- Display (hardware SPI) ----
@@ -73,8 +76,17 @@ const int   ADC_MAX      = 1023;    // Nano 33 IoT default 10-bit ADC
 // Travel is clamped to a safe band so the valve never slams its end stops.
 // 0% valve command -> SERVO_MIN_DEG, 100% -> SERVO_MAX_DEG.
 #define SERVO_PIN        6
-const int SERVO_MIN_DEG = 54;    // 30% of 180 deg travel
-const int SERVO_MAX_DEG = 126;   // 70% of 180 deg travel
+const int SERVO_MIN_DEG = 3; // Min servo travel
+const int SERVO_MAX_DEG = 126; // Max servo travel
+
+// Pulse range used by attach(). The Servo default (544-2400 us) pushes low
+// angles down to ~600-730 us, which many servos reject and go limp. Pinning
+// to a standard 1000-2000 us range keeps every commanded angle inside the
+// servo's reliable holding band. Widen toward 600/2400 if you need more
+// travel and your servo accepts it.
+const int SERVO_MIN_US = 950;
+const int SERVO_MAX_US = 2000;
+
 Servo valveServo;
 
 // Commands the valve to 0..100% within the safe band.
@@ -83,6 +95,27 @@ void setValvePercent(float pct) {
   int deg = SERVO_MIN_DEG + (int)((SERVO_MAX_DEG - SERVO_MIN_DEG) * pct / 100.0f + 0.5f);
   valveServo.write(deg);
 }
+
+// ---- PID temperature control ----
+// Ported from the proven sketch. Process variable is TC1, setpoint is the
+// pot target, output is the servo position. DIRECT acting (more output =
+// more heat).
+// conservative: Kp=1, Ki=0.05, Kd=0.25
+// aggressive:   Kp=4, Ki=0.2,  Kd=1
+double Kp = 4, Ki = 0.2, Kd = 1;
+
+// Below this target (setpoint) temperature the valve is forced closed.
+const double MIN_CONTROL_TEMP_C = 60;
+
+double target_temperature = 0;    // setpoint (from pot)
+double actual_temperature1 = 0;   // process variable (TC1)
+double servo_position = 0;        // PID output / valve command
+PID myPID(&actual_temperature1, &servo_position, &target_temperature, Kp, Ki, Kd, DIRECT);
+
+// Original controller used a 10 s cycle; lowered for debugging so the valve
+// reacts quickly. Raise back toward 10000 for normal operation.
+const unsigned long PID_PERIOD_MS = 1000;
+unsigned long lastPid = 0;
 
 // ---- Display layout (value column + row tops) ----
 #define VAL_X         80
@@ -109,6 +142,10 @@ float readTargetC() {
 
 void setup() {
   Serial.begin(115200);
+
+  // --- Servo init FIRST: always boot with the valve closed (= minimum) ---
+  valveServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  setValvePercent(0);   // 0% command -> SERVO_MIN_DEG (closed = the minimum)
 
   // --- Display init ---
   tft.init(240, 240, SPI_MODE3);
@@ -142,9 +179,8 @@ void setup() {
     Serial.println("MAX31855 #2 init failed!");
   }
 
-  // --- Servo init ---
-  valveServo.attach(SERVO_PIN);
-  setValvePercent(0);   // park at the safe minimum (30% travel)
+  // --- PID init ---
+  myPID.SetMode(AUTOMATIC);
 
   // Small settle delay for the MAX31855 reference junction.
   delay(500);
@@ -189,18 +225,43 @@ void drawTarget(int celsius) {
   tft.print(buf);
 }
 
-// Draws the valve position as a percentage. Opaque, fixed-width, flicker-free.
-void drawValve(int pct) {
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%3d %%", pct);
+// Renders the VLV cell. Only repaints when the text or color changes
+// (flicker-free) and left-pads to a fixed width so old glyphs are cleared.
+void drawValveCell(const char *text, uint16_t color) {
+  static char last[12] = "";
+  static uint16_t lastColor = 0;
+  if (strcmp(text, last) == 0 && color == lastColor) {
+    return;
+  }
+  strncpy(last, text, sizeof(last) - 1);
+  last[sizeof(last) - 1] = '\0';
+  lastColor = color;
+
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%-6s", text);   // fixed 6-char field
 
   tft.setTextSize(3);
-  tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
+  tft.setTextColor(color, ST77XX_BLACK);
   tft.setCursor(VAL_X, ROW_VALVE_Y);
   tft.print(buf);
 }
 
-void readAndReport(Adafruit_MAX31855 &tc, int16_t valueY, const char *label) {
+// PID-driven position, shown as a percentage (magenta).
+void drawValve(int pct) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d %%", pct);
+  drawValveCell(buf, ST77XX_MAGENTA);
+}
+
+// Hardcoded feedforward override state, shown instead of the percentage
+// (orange) so it's clear the value isn't coming from the PID loop.
+void drawValveMode(const char *label) {
+  drawValveCell(label, ST77XX_ORANGE);
+}
+
+// Reads a thermocouple, updates its display row, logs it, and returns the
+// temperature in Celsius (NAN on fault / no probe).
+float readAndReport(Adafruit_MAX31855 &tc, int16_t valueY, const char *label) {
   uint8_t fault = tc.readError();
   float c = tc.readCelsius();
 
@@ -215,6 +276,73 @@ void readAndReport(Adafruit_MAX31855 &tc, int16_t valueY, const char *label) {
     Serial.print(c);
     Serial.println(" C");
   }
+
+  return fault ? NAN : c;
+}
+
+// Ports the proven valve-control logic: a gap-based feedforward override when
+// far below setpoint and still cold, otherwise the PID. The result is a
+// 0..180 deg command (servo_position), which the original wrote straight to
+// the servo. Here we convert it to a valve % and apply it through the safe
+// 30-70% clamp instead of bypassing it.
+void updatePidValve() {
+  // On a bad sensor reading, fail safe: drive the valve closed (this also
+  // keeps the servo actively driven, so it never goes limp at startup while
+  // the MAX31855 cold-junction settles / reports an initial fault).
+  if (isnan(actual_temperature1)) {
+    setValvePercent(0);
+    drawValveMode("TC ERR");
+    Serial.println("PID skipped: TC1 fault -> valve closed");
+    return;
+  }
+
+  // Target below the control threshold: keep the valve hardcoded closed,
+  // overriding the PID and feedforward logic.
+  if (target_temperature < MIN_CONTROL_TEMP_C) {
+    setValvePercent(0);
+    drawValveMode("Closed");
+    Serial.print("Target below ");
+    Serial.print((int)MIN_CONTROL_TEMP_C);
+    Serial.println("C -> valve closed");
+    return;
+  }
+
+  // Detect which mode set servo_position: a hardcoded feedforward override
+  // or the PID loop itself.
+  bool overrideMode = true;
+  const char *modeLabel = "";
+
+  double gap = abs(target_temperature - actual_temperature1);
+  if (target_temperature > actual_temperature1 && actual_temperature1 <= 100 && gap >= 50) {
+    servo_position = 60;
+    modeLabel = "FF 60";
+  } else if (target_temperature > actual_temperature1 && actual_temperature1 <= 100 && gap >= 20) {
+    servo_position = 30;
+    modeLabel = "FF 30";
+  } else {
+    overrideMode = false;
+    myPID.SetTunings(Kp, Ki, Kd);
+    myPID.Compute();
+    servo_position = map(servo_position, 0, 255, 15, 180);
+  }
+
+  // Valve is always physically driven; only the display differs by mode.
+  float valve_pct = servo_position / 180.0f * 100.0f;
+  setValvePercent(valve_pct);
+
+  int pct_int = (int)(constrain(valve_pct, 0.0f, 100.0f) + 0.5f);
+  if (overrideMode) {
+    drawValveMode(modeLabel);     // show the hardcoded state, not the %
+  } else {
+    drawValve(pct_int);           // value came from the PID loop
+  }
+
+  Serial.print(overrideMode ? "FF" : "PID");
+  Serial.print(" -> Sp(deg): ");
+  Serial.print(servo_position);
+  Serial.print("  VLV: ");
+  Serial.print(pct_int);
+  Serial.println(" %");
 }
 
 void loop() {
@@ -228,33 +356,33 @@ void loop() {
   }
   filtered += 0.15f * (raw - filtered);
 
+  // The smoothed pot value is the PID setpoint.
+  target_temperature = filtered;
+
   static int lastShownTarget = -9999;
   if (lastShownTarget == -9999 || fabs(filtered - lastShownTarget) >= 1.0) {
     int shown = (int)(filtered + 0.5);
     if (shown != lastShownTarget) {
       drawTarget(shown);
-
-      // For now, drive the valve directly from the target temperature:
-      // map the full target range (TARGET_MIN_C..TARGET_MAX_C) to 0..100%.
-      // This placeholder is where the PID output will go later.
-      float pct = (shown - TARGET_MIN_C) / (TARGET_MAX_C - TARGET_MIN_C) * 100.0f;
-      setValvePercent(pct);
-      drawValve((int)(constrain(pct, 0.0f, 100.0f) + 0.5f));
-
       Serial.print("SET: ");
       Serial.print(shown);
-      Serial.print(" C  VLV: ");
-      Serial.print((int)(pct + 0.5f));
-      Serial.println(" %");
+      Serial.println(" C");
       lastShownTarget = shown;
     }
   }
 
-  // Thermocouples update on the slower cadence.
   unsigned long now = millis();
+
+  // Thermocouples update on the display cadence; TC1 feeds the PID.
   if (now - lastUpdate >= UPDATE_MS) {
     lastUpdate = now;
-    readAndReport(thermocouple1, ROW_TC1_Y, "TC1");
+    actual_temperature1 = readAndReport(thermocouple1, ROW_TC1_Y, "TC1");
     readAndReport(thermocouple2, ROW_TC2_Y, "TC2");
+  }
+
+  // PID drives the valve on its own (slower) control cycle.
+  if (now - lastPid >= PID_PERIOD_MS) {
+    lastPid = now;
+    updatePidValve();
   }
 }
